@@ -1,63 +1,66 @@
-# etl/load.py
-from typing import Dict, List, Tuple, Any
-from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
+from typing import Dict, List
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from app.models import Station, Measurement, ParameterEnum
+STATION_UPSERT_SQL = text("""
+INSERT INTO stations (source, external_id, city, name, lat, lon)
+VALUES (:source, :external_id, :city, :name, :lat, :lon)
+ON CONFLICT (external_id)
+DO UPDATE SET
+  city = EXCLUDED.city,
+  name = EXCLUDED.name,
+  lat = EXCLUDED.lat,
+  lon = EXCLUDED.lon
+RETURNING id
+""")
 
-def upsert_batch_hours(db, items: List[Dict[str, Any]]) -> int:
-    """
-    items — результаты transform.clean_hours(...).
-    1) upsert Station по (source, external_id),
-    2) bulk insert Measurement с ON CONFLICT DO NOTHING по (station_id, parameter, measured_at).
-    """
-    if not items:
-        return 0
+STATION_ID_SQL = text("""
+SELECT id FROM stations WHERE external_id = :external_id
+""")
 
-    stations_map: Dict[Tuple[str, str], int] = {}
+MEAS_UPSERT_SQL = text("""
+INSERT INTO measurements (station_id, parameter, value, unit, measured_at)
+VALUES (:station_id, :parameter, :value, :unit, :measured_at)
+ON CONFLICT (station_id, parameter, measured_at)
+DO UPDATE SET
+  value = EXCLUDED.value,
+  unit  = EXCLUDED.unit
+""")
 
-    # 1) станции
-    for it in items:
-        key = (it["source"], it["external_id"])
-        if key in stations_map:
-            continue
+def _ensure_station(db: Session, row: Dict) -> int:
+    res = db.execute(STATION_UPSERT_SQL, {
+        "source": row["source"],
+        "external_id": int(row["external_location_id"]),
+        "city": row["city"],
+        "name": row["station_name"],
+        "lat": float(row["lat"]),
+        "lon": float(row["lon"]),
+    })
+    sid = res.scalar()
+    if sid is not None:
+        return int(sid)
+    sid2 = db.execute(STATION_ID_SQL, {"external_id": int(row["external_location_id"])}).scalar_one()
+    return int(sid2)
 
-        st = db.execute(
-            select(Station).where(
-                Station.source == it["source"],
-                Station.external_id == it["external_id"],
-            )
-        ).scalar_one_or_none()
+def upsert_batch_hours(db: Session, rows: List[Dict]) -> int:
+    inserted_or_updated = 0
+    station_id_cache: Dict[int, int] = {}
 
-        if not st:
-            st = Station(
-                source=it["source"],
-                external_id=it["external_id"],
-                city=it.get("city"),
-                name=it.get("station_name"),
-                lat=it.get("lat"),
-                lon=it.get("lon"),
-            )
-            db.add(st)
-            db.flush()  # получаем st.id
+    for r in rows:
+        ext_id = int(r["external_location_id"])
+        if ext_id in station_id_cache:
+            station_id = station_id_cache[ext_id]
+        else:
+            station_id = _ensure_station(db, r)
+            station_id_cache[ext_id] = station_id
 
-        stations_map[key] = st.id
-
-    # 2) measurements (bulk)
-    rows = []
-    for it in items:
-        rows.append({
-            "station_id": stations_map[(it["source"], it["external_id"])],
-            "parameter": ParameterEnum(it["parameter"]),
-            "value": it["value"],
-            "unit": it["unit"],
-            "measured_at": it["measured_at"],  # ISO UTC -> timestamptz
+        db.execute(MEAS_UPSERT_SQL, {
+            "station_id": station_id,
+            "parameter": r["parameter"],
+            "value": float(r["value"]),
+            "unit": r.get("unit") or "",
+            "measured_at": r["measured_at"],
         })
+        inserted_or_updated += 1
 
-    ins = insert(Measurement).values(rows)
-    do_nothing = ins.on_conflict_do_nothing(
-        index_elements=["station_id", "parameter", "measured_at"]
-    )
-    db.execute(do_nothing)
-    db.commit()
-    return len(rows)
+    return inserted_or_updated

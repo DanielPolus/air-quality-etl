@@ -1,19 +1,14 @@
 from pydantic import BaseModel
-from datetime import datetime
 from typing import Optional
 
-class MeasurementOut(BaseModel):
-    city: Optional[str]
-    station: Optional[str]
-    lat: Optional[float]
-    lon: Optional[float]
-    parameter: str
-    value: float
-    unit: str
-    measured_at: datetime
-
-    class Config:
-        from_attributes = True
-
-class CityOut(BaseModel):
+class AvgOut(BaseModel):
     city: str
+    parameter: str
+    window_hours: int
+    avg_value: Optional[float]
+    n: int
+
+class TrendPoint(BaseModel):
+    date: str
+    avg: Optional[float]
+    n: int

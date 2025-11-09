@@ -1,13 +1,8 @@
-# etl/transform.py
 from typing import Dict, Iterable, List
 
 ALLOWED_PARAMS = {"pm25", "pm10", "no2", "o3"}
 
 def clean_hours(rows: List[Dict], allowed_params: Iterable[str] = ALLOWED_PARAMS) -> List[Dict]:
-    """
-    Фильтрует и приводит «часовки» из sources.openaq.fetch_city_hours(...).
-    Возвращает словари, готовые к загрузке.
-    """
     allowed = set(allowed_params)
     out: List[Dict] = []
     for r in rows:
@@ -27,9 +22,9 @@ def clean_hours(rows: List[Dict], allowed_params: Iterable[str] = ALLOWED_PARAMS
             "station_name": r.get("station_name"),
             "lat": r.get("lat"),
             "lon": r.get("lon"),
-            "parameter": p,          # 'pm25'|'pm10'|'no2'|'o3'
+            "parameter": p,
             "value": float(v),
             "unit": r.get("unit") or "",
-            "measured_at": ts,       # ISO UTC
+            "measured_at": ts,
         })
     return out

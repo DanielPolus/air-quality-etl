@@ -1,51 +1,61 @@
-# etl/run_etl.py
 import os
-from typing import Dict, Tuple
-from dotenv import load_dotenv
+import time
+from typing import Dict, List
+from datetime import datetime, timezone
 
-from app.db import SessionLocal
-from etl.sources.openaq import fetch_city_hours
-from etl.transform import clean_hours
+from app.db import db_session
+from etl.sources.openaq import fetch_city_measurements_v3
 from etl.load import upsert_batch_hours
 
-load_dotenv()
+HOURS_BACK = int(os.getenv("ETL_HOURS_BACK", "8"))
+MAX_LOCATIONS = int(os.getenv("ETL_MAX_LOCATIONS", "5"))
+MAX_SENSORS = int(os.getenv("ETL_MAX_SENSORS", "12"))
+SLEEP_BETWEEN_CALLS = float(os.getenv("ETL_SLEEP", "0.4"))
 
-# .env:
-# AIRQ_CITY_COORDS=Bucharest:44.4268,26.1025;București:44.4268,26.1025
-# INGEST_PARAMETERS=pm25,pm10,no2,o3
-# HOURS_BACK=24
+CITIES: Dict[str, Dict] = {
+    "Bucharest": {"lat": 44.4268, "lon": 26.1025},
+}
 
-def _parse_city_coords(env_val: str) -> Dict[str, Tuple[float, float]]:
-    out: Dict[str, Tuple[float, float]] = {}
-    if not env_val:
-        return out
-    pairs = [p.strip() for p in env_val.split(";") if p.strip()]
-    for pair in pairs:
-        name, coords = pair.split(":", 1)
-        lat_s, lon_s = coords.split(",", 1)
-        out[name.strip()] = (float(lat_s), float(lon_s))
+def _parse_iso_utc(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).astimezone(timezone.utc)
+
+def limit_latest_per_sensor(rows: List[Dict], max_sensors: int = None) -> List[Dict]:
+    latest = {}
+    for r in rows:
+        key = (r["sensor_id"], r["parameter"])
+        ts = _parse_iso_utc(r["measured_at"])
+        if key not in latest or _parse_iso_utc(latest[key]["measured_at"]) < ts:
+            latest[key] = r
+    out = list(latest.values())
+    if max_sensors:
+        out = out[:max_sensors]
     return out
 
-CITY_COORDS = _parse_city_coords(os.getenv(
-    "AIRQ_CITY_COORDS",
-    "Bucharest:44.4268,26.1025"
-))
-INGEST_PARAMETERS = [p.strip() for p in os.getenv("INGEST_PARAMETERS", "pm25,pm10,no2,o3").split(",") if p.strip()]
-HOURS_BACK = int(os.getenv("HOURS_BACK", "24"))
-
 def run_once():
-    total_inserted = 0
-    with SessionLocal() as db:
-        for city, (lat, lon) in CITY_COORDS.items():
-            raw_rows = fetch_city_hours(
-                city_name=city, lat=lat, lon=lon, hours_back=HOURS_BACK,
-                max_locations=6, sleep_between_sensors=0.15
+    total = 0
+    with db_session() as db:
+        for city, coords in CITIES.items():
+            print(f"[ETL] City={city} hours_back={HOURS_BACK}")
+            rows = fetch_city_measurements_v3(
+                city_name=city,
+                lat=coords["lat"],
+                lon=coords["lon"],
+                hours_back=HOURS_BACK,
+                max_locations=MAX_LOCATIONS,
+                max_sensors=MAX_SENSORS,
+                max_rows_total=2000,
             )
-            items = clean_hours(raw_rows, allowed_params=INGEST_PARAMETERS)
-            n = upsert_batch_hours(db, items)
-            print(f"{city}: fetched={len(items)} inserted={n}")
-            total_inserted += n
-    print(f"TOTAL inserted: {total_inserted}")
+            print(f"[ETL] fetched {len(rows)} rows")
+            if not rows:
+                print("[ETL] nothing to insert"); continue
+            n = upsert_batch_hours(db, rows)
+            db.commit()
+            total += n
+            print(f"[ETL] inserted/updated={n}")
+            time.sleep(SLEEP_BETWEEN_CALLS)
+    print(f"[ETL] DONE. total_inserted_or_updated={total}")
 
 if __name__ == "__main__":
     run_once()
